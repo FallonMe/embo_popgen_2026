@@ -21,7 +21,7 @@ library(admixtools)
 library(ggplot2)
 
 # Set a working directory within your home directory
-setwd("~/test/")
+setwd("~/Documents/Documents - Fallon MacBook Pro/EMBO_PopGen_2026/Day1/embo_popgen_2026/Sandra_Oliveira/data")
 
 # File paths used throughout this tutorial
 info_file  <- "info_embo_1240k.txt"                 # metadata (one row per individual)
@@ -75,6 +75,19 @@ results <- lapply(0:4, function(n) {
 # Questions: What is the minimum number of admixture events required to obtain a 
 # graph with the worst residuals (Z scores) below 3 in your results?
 # Does the score improve substantially for higher number of admixture events?
+
+
+| # admixture events | Best score |
+#  | ------------------ | ---------: |
+# | 0                  |      951.8 |
+# | 1                  |      626.4 |
+#  | 2                  |      114.2 |
+# | 3                  |      0.004 |
+# | 4                  |      0.020 |
+
+#|Z|max < 3 → graph is considered an acceptable fit
+
+results[[4]]$qpg$worst_residual
 
 
 ################################################################################
@@ -181,6 +194,16 @@ nadmix_table
 lapply(candidates, function(cand) summarize_eventorder(cand$igraph))
 
 
+# the winner graphs are different 
+#Mostly yes.
+# The fact that all runs converged to acceptable 3-admixture solutions means they are all near local optima.
+# The bootstrap scores for run 1: mostly ~0.005-0.01 with occasional larger values due to some bootstrap replicates.
+# That tells you the graph fits extremely well overall, but there is some variability in the score across bootstrap replicates, which is expected given the finite number of SNPs.
+
+# So:Run 3 is significantly worse than the others.
+# Runs 1, 2, 4, and 5 are statistically indistinguishable.
+#That means there are at least four different graph topologies that explain the data equally well.
+
 ################################################################################
 # PART 3: qpWave and qpAdm
 ################################################################################
@@ -281,7 +304,11 @@ good_pairs <- two_wave_table[two_wave_table$p_rank1>0.05, ]
 # Question: Can we describe the Ju'|hoan North as deriving from two of the 
 # populations tested alone, given the chosen right populations? Is there a
 # single good-fiting model?
-
+| Source 1            | Source 2            | p_rank1 |
+  | ------------------- | ------------------- | ------- |
+  | Ethiopia_4500BP     | South_Africa_2000BP | 0.074   |
+  | Malawi_2500-16000BP | South_Africa_2000BP | 0.060   |
+  
 
 # ── qpAdm: estimate admixture proportions for non-rejected two-source models ─
 # qpAdm uses the same left/right structure as qpWave but additionally estimates
@@ -314,6 +341,7 @@ qpadm_results <- lapply(seq_len(nrow(good_pairs)), function(i) {
 # try to describe it as a 1-wave or multiple-wave mixture of other populations.
 
 
+
 ################################################################################
 # END OF TUTORIAL
 #
@@ -326,4 +354,287 @@ qpadm_results <- lapply(seq_len(nrow(good_pairs)), function(i) {
 #     SNP ascertainment schemes
 #   - ADMIXTOOLS v2 documentation
 ################################################################################
+
+
+# interpretable “archaic introgression + outgroup” graph: Chimp, Denisova, two Neanderthals, Han, French, Papuan, and Yoruba. 
+# It should recover the broad signals: Denisova closer to Papuan than Han/French, Neanderthal closer to non-Africans than Yoruba, and Chimp as the outgroup.
+
+################################################################################
+# PART 1: Building admixture graphs with find_graphs()
+################################################################################
+
+# Interesting population set:
+# Chimp = outgroup
+# Yoruba = African reference with little/no archaic introgression
+# French/Han = non-Africans with Neanderthal ancestry
+# Papuan = non-African with both Neanderthal + Denisovan ancestry
+# Neanderthals + Denisova = archaic references
+
+pops <- c(
+  "Chimp",
+  "Yoruba",
+  "Han",
+  "Papuan",
+  "Denisova"
+)
+
+# Check metadata
+pop_meta %>%
+  filter(Group %in% pops) %>%
+  select(Group, Continent, Language, Lat, Long, Date_mean_BP)
+
+# Compute f2 blocks
+f2_blocks_archaic <- f2_from_geno(
+  prefix,
+  pops = pops
+)
+
+# Test 0 to 4 admixture events
+results_archaic <- lapply(0:4, function(n) {
+  
+  cat("\n====================================\n")
+  cat("Running numadmix =", n, "\n")
+  cat("====================================\n")
+  
+  g <- find_graphs(
+    f2_blocks_archaic,
+    numadmix = n,
+    outpop = "Chimp"
+  )
+  
+  winner <- g[which.min(g$score), ]
+  
+  qpg <- qpgraph(
+    f2_blocks_archaic,
+    edges_to_igraph(winner$edges[[1]]),
+    return_fstats = TRUE
+  )
+  
+  cat("Best score:", winner$score, "\n")
+  cat("Worst residual:", qpg$worst_residual, "\n")
+  
+  p <- plot_graph(
+    winner$edges[[1]],
+    textsize = 4,
+    fix = TRUE
+  ) +
+    ggtitle(
+      paste0(
+        "numadmix = ", n,
+        " | score = ", round(winner$score, 3),
+        " | worst residual = ", round(qpg$worst_residual, 2)
+      )
+    )
+  
+  print(p)
+  
+  list(
+    numadmix = n,
+    winner = winner,
+    qpg = qpg,
+    graph = edges_to_igraph(winner$edges[[1]])
+  )
+})
+
+# Summarize scores and worst residuals
+graph_summary <- data.frame(
+  numadmix = 0:4,
+  score = sapply(results_archaic, function(x) x$winner$score),
+  worst_residual = sapply(results_archaic, function(x) x$qpg$worst_residual)
+)
+
+graph_summary
+
+# Question to answer:
+# What is the minimum number of admixture events needed for worst_residual < 3?
+graph_summary %>%
+  filter(abs(worst_residual) < 3)
+
+################################################################################
+# PART 2: Robustness of the admixture graph results
+################################################################################
+
+# Choose the best-supported number of admixture events.
+
+best_numadmix <- 1
+
+n_runs <- 5
+
+candidates <- lapply(1:n_runs, function(i) {
+  
+  cat("\n====================================\n")
+  cat("Candidate run", i, "| numadmix =", best_numadmix, "\n")
+  cat("====================================\n")
+  
+  g <- find_graphs(
+    f2_blocks_archaic,
+    numadmix = best_numadmix,
+    outpop = "Chimp"
+  )
+  
+  winner <- g[which.min(g$score), ]
+  
+  qpg <- qpgraph(
+    f2_blocks_archaic,
+    edges_to_igraph(winner$edges[[1]]),
+    return_fstats = TRUE
+  )
+  
+  cat("Run", i,
+      "| score =", round(winner$score, 4),
+      "| worst residual =", round(qpg$worst_residual, 3),
+      "\n")
+  
+  p <- plot_graph(
+    winner$edges[[1]],
+    textsize = 4,
+    fix = TRUE
+  ) +
+    ggtitle(
+      paste0(
+        "Candidate ", i,
+        " | score = ", round(winner$score, 3),
+        " | worst residual = ", round(qpg$worst_residual, 2)
+      )
+    )
+  
+  print(p)
+  
+  list(
+    edges = winner$edges[[1]],
+    igraph = edges_to_igraph(winner$edges[[1]]),
+    score = winner$score,
+    qpg = qpg
+  )
+})
+
+# Candidate summary
+candidate_summary <- data.frame(
+  run = paste0("run", 1:n_runs),
+  score = sapply(candidates, function(x) x$score),
+  worst_residual = sapply(candidates, function(x) x$qpg$worst_residual)
+)
+
+candidate_summary
+
+################################################################################
+# Bootstrap-resampled SNP-block evaluation
+################################################################################
+
+fits <- lapply(candidates, function(cand) {
+  qpgraph_resample_snps(
+    f2_blocks_archaic,
+    graph = cand$igraph,
+    boot = 100
+  )
+})
+
+# Inspect score variation for candidate 1
+fits[[1]]$score
+
+# Pairwise model comparison
+cat("\nPairwise model comparisons:\n")
+
+pairwise_results <- list()
+
+counter <- 1
+
+for (i in 1:(n_runs - 1)) {
+  for (j in (i + 1):n_runs) {
+    
+    cf <- compare_fits(
+      fits[[i]]$score,
+      fits[[j]]$score
+    )
+    
+    cat(
+      "Run", i, "vs Run", j,
+      "| p_emp =", round(cf$p_emp, 3),
+      "| 95% CI score diff: [",
+      round(cf$ci_low, 4), ",",
+      round(cf$ci_high, 4), "]\n"
+    )
+    
+    pairwise_results[[counter]] <- data.frame(
+      run1 = paste0("run", i),
+      run2 = paste0("run", j),
+      p_emp = cf$p_emp,
+      ci_low = cf$ci_low,
+      ci_high = cf$ci_high
+    )
+    
+    counter <- counter + 1
+  }
+}
+
+pairwise_results <- bind_rows(pairwise_results)
+pairwise_results
+
+# Which comparisons are significant?
+pairwise_results %>%
+  mutate(significant = p_emp < 0.05)
+
+################################################################################
+# Summarize admixture counts per population
+################################################################################
+
+nadmix_list <- lapply(seq_along(candidates), function(i) {
+  df <- summarize_numadmix(candidates[[i]]$igraph)
+  setNames(df$nadmix, df$pop)
+})
+
+nadmix_table <- do.call(
+  cbind,
+  lapply(nadmix_list, function(x) x[pops])
+)
+
+rownames(nadmix_table) <- pops
+colnames(nadmix_table) <- paste0("run", seq_along(candidates))
+
+nadmix_table
+
+################################################################################
+# Summarize event order
+################################################################################
+
+event_order <- lapply(
+  candidates,
+  function(cand) summarize_eventorder(cand$igraph)
+)
+
+event_order
+
+# Print more rows if needed
+event_order[[1]] %>% print(n = 50)
+
+################################################################################
+# Interpretation guide
+################################################################################
+
+# Expected biological interpretation:
+#
+#
+# 1. Yoruba branching outside non-Africans.
+# 2. French, Han, and Papuan sharing drift relative to Yoruba.
+# 3. Neanderthal-related admixture into non-Africans.
+# 4. Denisovan-related admixture into Papuan.
+#
+# If numadmix = 2 gives worst_residual < 3:
+#   This is a clean model: Neanderthal + Denisovan introgression.
+#
+# If numadmix = 3 is needed:
+#   The simple story is insufficient, likely because:
+#   - Altai vs Vindija Neanderthal are not equivalent
+#   - Papuan has complex archaic ancestry
+#   - Han/French have different Neanderthal-related affinities
+#   - graph topology is compensating for missing ancient modern human sources
+#
+# Main lesson:
+#   Do not interpret the best graph as the literal true history.
+#   Interpret repeated, robust features across good-fitting graphs.
+
+
+
+
+
 

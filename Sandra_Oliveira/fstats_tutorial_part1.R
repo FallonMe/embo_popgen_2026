@@ -27,17 +27,19 @@
 # combination of bash scripting and manual editing of input files.
 #
 # All necessary packages for this tutorial have been pre-installed:
-# devtools::install_github("uqrmaie1/admixtools")
+#devtools::install_github("uqrmaie1/admixtools")
 # install.packages("ggplot2") # for plotting
 # install.packages("maps")    # for plotting on a world map
 #
 # load the packages
+install.packages("admixtools", repos = c("https://evolecolgroup.r-universe.dev", "https://cloud.r-project.org"))
+
 library(admixtools)
 library(ggplot2)
 library(maps)
 #
 # Set a working directory within your home directory
-setwd("~/test/")
+setwd("~/Documents/Documents - Fallon MacBook Pro/EMBO_PopGen_2026/Day1/embo_popgen_2026/Sandra_Oliveira/data")
 
 
 # --- 0.2  Data provenance ---
@@ -591,8 +593,6 @@ ggplot(archaic_f4, aes(x=label, y=est, colour=archaic, shape=sig)) +
 # Question: Are there differences in the Neanderthal signal?
 # What could cause these differences?
 
-
-
 ################################################################################
 # PART 6: F4-RATIO — QUANTIFYING ADMIXTURE PROPORTIONS
 ################################################################################
@@ -646,3 +646,118 @@ par(mar=c(5, 4, 4, 2))
 #   - Petr et al. (2019) PNAS
 #   - ADMIXTOOLS v2 documentation
 ################################################################################
+
+
+#try F4 test and F4 ratio test for other interesting populations, e.g. African admixture in North Africans
+# Use f4 to test actual demographic hypotheses, then use f4-ratio if the topology is simple enough to estimate ancestry proportions.
+
+# Is North Africa admixed between Sub-Saharan Africans and Eurasians?
+
+#Mozabite
+#Saharawi
+
+non_africans <- pop_meta$Group[pop_meta$Continent != "Africa" & pop_meta$Group %in% modern]
+
+# Compute f2 blocks for all relevant populations in one pass
+f2_blocks_strict <- f2_from_geno(prefix, maxmiss = 0,
+                                 pops = c(outgroup, "Vindija_Neanderthal",
+                                          "Altai_Neanderthal", denisovan,
+                                          "Yoruba", non_africans))
+
+f4(
+  f2_blocks,
+  pop1 = "Chimp",
+  pop2 = "French",
+  pop3 = "Yoruba",
+  pop4 = c("Mozabite","Saharawi")
+)
+
+
+
+#Mozabite shares more alleles with French than Yoruba does
+#Saharawi shares more alleles with French than Yoruba does
+
+
+
+# Which North African group has more Eurasian ancestry?
+f4(
+  f2_blocks,
+  pop1="Chimp",
+  pop2="French",
+  pop3="Mozabite",
+  pop4="Saharawi"
+)
+
+
+
+
+f4(
+  f2_blocks,
+  pop1="Chimp",
+  pop2="Khomani",
+  pop3="Mbuti",
+  pop4="Biaka"
+)
+
+
+
+
+
+# Populations needed for this specific f4 test
+test_pops <- c("Chimp", "French", "Yoruba", "Mozabite", "Saharawi")
+
+# Compute f2 blocks directly from genotype data
+# maxmiss = 0 means only SNPs present in all selected populations are used
+f2_blocks_nafrica <- f2_from_geno(
+  prefix,
+  maxmiss = 0,
+  pops = test_pops
+)
+
+# Run f4 test:
+# f4(Chimp, French; Yoruba, X)
+# Positive = X shares more alleles with French than Yoruba does
+north_africa_f4 <- f4(
+  f2_blocks_nafrica,
+  pop1 = "Chimp",
+  pop2 = "French",
+  pop3 = "Yoruba",
+  pop4 = c("Mozabite", "Saharawi")
+)
+
+north_africa_f4
+
+
+
+
+
+
+# Test continuity between ancient and modern North Africans
+
+f4(
+  f2_blocks,
+  pop1="Chimp",
+  pop2="Morocco_7000BP",
+  pop3="Mozabite",
+  pop4="Saharawi"
+)
+
+  
+  
+
+
+
+  
+  
+
+# f4-ratio: Eurasian ancestry in Somali
+
+# Approximate estimate:
+pops_matrix <- cbind(
+  "French",
+  "Chimp",
+  "Somali",
+  "Yoruba",
+  "Mozabite"
+)
+

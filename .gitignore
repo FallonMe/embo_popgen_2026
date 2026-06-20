@@ -2,3 +2,7 @@
 .Rhistory
 .RData
 .Ruserdata
+.DS_Store
+*.rds
+*.geno
+Sandra_Oliveira/data/f2data_1240k/
