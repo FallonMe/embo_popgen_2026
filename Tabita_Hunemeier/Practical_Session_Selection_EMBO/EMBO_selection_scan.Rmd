@@ -1,0 +1,869 @@
+---
+title: "EMBO Practical Course: Genomic Diversity and Natural Selection Scans"
+author: "Fallon Meng"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: readable
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+# Global knitr options.
+# Set eval = FALSE for computationally heavy chunks by default.
+# Change eval = TRUE once you are in the correct working directory and have all input files.
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 4.8,
+  dpi = 150
+)
+
+# Packages used throughout the practical.
+# Install missing packages if needed:
+# install.packages(c("tidyverse", "data.table", "ggrepel", "qqman", "pcadapt"))
+#install.packages("rehh")
+
+library(tidyverse)
+library(data.table)
+library(ggplot2)
+
+# Optional packages. Loaded only where needed.
+library(rehh)
+library(pcadapt)
+
+# Directory structure assumed by the course worksheet.
+human_dir <- "input/Part_1_HumanDiversity"
+dog_dir   <- "input/Part_2_CanidDiversity"
+out_dir   <- "output"
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Candidate loci.
+edar_pos <- 109513601
+igf1_start <- 41e6
+igf1_end   <- 45.5e6
+```
+
+# Overview
+
+This R Markdown file completes the EMBO practical worksheet on genomic diversity and natural selection scans. It contains commented code for:
+
+1. Pairwise $F_{ST}$ and PBS around human **EDAR**.
+2. Haplotype-based scans around **EDAR** using `rehh`.
+3. PCA and PCAdapt outlier scans for dog chromosome 15.
+4. XP-nSL and Rsb scans for the dog **IGF1** body-size locus.
+
+Most chunks assume that the course input files are already present in the `input/` directory. Heavy analyses are written as runnable code, but some chunks are set to `eval=FALSE` because they require large VCF/BCF files or external binaries such as `bcftools`, `plink1.9`, and `selscan`.
+
+# Part 1: Human genomic diversity and natural selection
+
+## 1. Helper functions
+
+```{r helper-functions}
+# Read vcftools --weir-fst-pop output robustly.
+# Expected columns are usually: CHROM, POS, WEIR_AND_COCKERHAM_FST.
+read_fst <- function(file, value_name) {
+  x <- fread(file, data.table = FALSE)
+  names(x) <- toupper(names(x))
+  
+  fst_col <- grep("FST", names(x), value = TRUE)[1]
+  if (is.na(fst_col)) {
+    stop("Could not find an FST column in: ", file)
+  }
+  
+  x %>%
+    transmute(
+      CHROM = as.character(CHROM),
+      POS = as.integer(POS),
+      !!value_name := as.numeric(.data[[fst_col]])
+    ) %>%
+    # Duplicate positions can happen after filtering or multi-allelic handling.
+    # Keep the first non-missing record per physical position.
+    filter(!is.na(.data[[value_name]])) %>%
+    distinct(CHROM, POS, .keep_all = TRUE)
+}
+
+# Negative Weir & Cockerham FST values are sampling artifacts.
+# They do not mean populations are "less than identical"; biologically they are treated as zero.
+zero_negative <- function(x) ifelse(is.na(x), NA_real_, pmax(x, 0))
+
+# FST to Reynolds-like distance used in PBS.
+# T = -log(1 - FST). Clamp FST just below 1 to avoid Inf.
+fst_to_T <- function(fst) {
+  fst <- pmin(pmax(fst, 0), 0.999999)
+  -log(1 - fst)
+}
+
+# Population Branch Statistic for population A given pairwise distances among A, B, C.
+# PBS_A = (T_AB + T_AC - T_BC) / 2
+calc_pbs <- function(fst_ab, fst_ac, fst_bc) {
+  T_ab <- fst_to_T(fst_ab)
+  T_ac <- fst_to_T(fst_ac)
+  T_bc <- fst_to_T(fst_bc)
+  pmax((T_ab + T_ac - T_bc) / 2, 0)
+}
+
+# Return the empirical quantile/rank of a focal value in a genome-wide distribution.
+empirical_quantile <- function(values, focal_value) {
+  values <- values[is.finite(values)]
+  mean(values <= focal_value, na.rm = TRUE)
+}
+
+# Generic candidate-region plot.
+plot_candidate_scan <- function(df, y, pos = edar_pos, window = 10000,
+                                title = "Candidate-region scan",
+                                ylab = NULL) {
+  y <- rlang::ensym(y)
+  if (is.null(ylab)) ylab <- rlang::as_string(y)
+  
+  df_win <- df %>%
+    filter(POS >= pos - window, POS <= pos + window)
+  
+  ggplot(df_win, aes(x = POS, y = !!y)) +
+    geom_point(alpha = 0.65, size = 1.6) +
+    geom_vline(xintercept = pos, linetype = "dashed") +
+    labs(
+      title = title,
+      x = "Position on chromosome 2 (bp)",
+      y = ylab
+    ) +
+    theme_bw()
+}
+```
+
+## 2. Pairwise $F_{ST}$ at EDAR
+
+### Biological interpretation
+
+Negative Weir and Cockerham $F_{ST}$ estimates are not evidence of negative population differentiation. They are estimator noise, usually caused by finite sample size and variance components. In practice, they are commonly set to zero before downstream summaries. `NA` values usually mean the statistic could not be estimated at that site, often because the site is uninformative or missing in one comparison. Keeping `NA` or negative values can distort quantiles, PBS, and plots.
+
+```{r human-fst}
+# File paths.
+fst_afr_eas_file <- file.path(human_dir, "AFR_EAS.weir.fst")
+fst_afr_eur_file <- file.path(human_dir, "AFR_EUR.weir.fst")
+fst_eas_eur_file <- file.path(human_dir, "EAS_EUR.weir.fst")
+
+# Read pairwise FST files.
+fst_afr_eas <- read_fst(fst_afr_eas_file, "FST_AFR_EAS")
+fst_afr_eur <- read_fst(fst_afr_eur_file, "FST_AFR_EUR")
+fst_eas_eur <- read_fst(fst_eas_eur_file, "FST_EAS_EUR")
+
+# Align by overlapping SNP positions across all three comparisons.
+fst_all <- fst_afr_eas %>%
+  inner_join(fst_afr_eur, by = c("CHROM", "POS")) %>%
+  inner_join(fst_eas_eur, by = c("CHROM", "POS")) %>%
+  mutate(
+    FST_AFR_EAS_raw = FST_AFR_EAS,
+    FST_AFR_EUR_raw = FST_AFR_EUR,
+    FST_EAS_EUR_raw = FST_EAS_EUR,
+    FST_AFR_EAS = zero_negative(FST_AFR_EAS),
+    FST_AFR_EUR = zero_negative(FST_AFR_EUR),
+    FST_EAS_EUR = zero_negative(FST_EAS_EUR)
+  )
+
+# Check candidate SNP rs3827760.
+edar_fst <- fst_all %>% filter(POS == edar_pos)
+edar_fst
+
+# Empirical quantiles of rs3827760 in each pairwise FST distribution.
+edar_fst_quantiles <- tibble(
+  comparison = c("AFR_EAS", "AFR_EUR", "EAS_EUR"),
+  edar_fst = c(edar_fst$FST_AFR_EAS, edar_fst$FST_AFR_EUR, edar_fst$FST_EAS_EUR),
+  empirical_quantile = c(
+    empirical_quantile(fst_all$FST_AFR_EAS, edar_fst$FST_AFR_EAS),
+    empirical_quantile(fst_all$FST_AFR_EUR, edar_fst$FST_AFR_EUR),
+    empirical_quantile(fst_all$FST_EAS_EUR, edar_fst$FST_EAS_EUR)
+  )
+)
+edar_fst_quantiles
+
+# Plot 10 kb window around the candidate SNP for each pairwise comparison.
+plot_candidate_scan(fst_all, FST_AFR_EAS, title = "AFR vs EAS FST around EDAR", ylab = "FST")
+plot_candidate_scan(fst_all, FST_AFR_EUR, title = "AFR vs EUR FST around EDAR", ylab = "FST")
+plot_candidate_scan(fst_all, FST_EAS_EUR, title = "EAS vs EUR FST around EDAR", ylab = "FST")
+```
+
+### Take-home answer
+
+If rs3827760 lies in the extreme upper tail for comparisons involving EAS, especially AFR-EAS and/or EAS-EUR, it supports unusually strong allele-frequency differentiation involving East Asians. Pairwise $F_{ST}$ tells us that two populations differ, but it does not cleanly assign the excess differentiation to one branch of a three-population tree. That is why PBS is useful.
+
+## 3. Population Branch Statistic for EAS
+
+PBS partitions pairwise differentiation among three populations into branch-specific components. For East Asians:
+
+\[
+PBS_{EAS} = \frac{T_{AFR,EAS} + T_{EAS,EUR} - T_{AFR,EUR}}{2}
+\]
+
+where \(T = -\log(1 - F_{ST})\).
+
+```{r human-pbs}
+fst_pbs <- fst_all %>%
+  mutate(
+    PBS_EAS = calc_pbs(
+      fst_ab = FST_AFR_EAS,
+      fst_ac = FST_EAS_EUR,
+      fst_bc = FST_AFR_EUR
+    )
+  )
+
+edar_pbs <- fst_pbs %>% filter(POS == edar_pos)
+edar_pbs %>% select(CHROM, POS, PBS_EAS)
+
+tibble(
+  statistic = "PBS_EAS",
+  edar_value = edar_pbs$PBS_EAS,
+  empirical_quantile = empirical_quantile(fst_pbs$PBS_EAS, edar_pbs$PBS_EAS)
+)
+
+plot_candidate_scan(fst_pbs, PBS_EAS, title = "PBS_EAS around EDAR", ylab = "PBS_EAS")
+```
+
+### Take-home answer
+
+PBS asks a slightly sharper evolutionary question than pairwise $F_{ST}$: which population branch shows excess differentiation? If $PBS_{EAS}$ peaks at rs3827760 or nearby EDAR-linked SNPs, the result is consistent with lineage-specific selection in East Asians rather than generic differentiation among all three continental groups.
+
+## 4. EHH and furcation trees around rs3827760
+
+Recent positive selection can drive a beneficial allele upward so quickly that recombination has little time to break down the surrounding haplotype. The selected allele is therefore expected to sit on a long, high-frequency haplotype background. In EDAR, the derived allele should show stronger extended haplotype homozygosity in EAS than in AFR.
+
+```{r ehh-furcation, eval=FALSE}
+library(rehh)
+
+# Input VCFs. These should be phased.
+vfile_afr <- file.path(human_dir, "Chr2_EDAR_LWK_500K.recode.vcf")
+vfile_eas <- file.path(human_dir, "Chr2_EDAR_CHS_500K.recode.vcf")
+
+# Convert VCF to haplohh objects.
+# polarize_vcf = FALSE means we trust the existing 0/1 coding in the VCF.
+# If ancestral/derived state is known and the VCF is polarized, set polarize_vcf = TRUE.
+hh_afr <- data2haplohh(
+  hap_file = vfile_afr,
+  polarize_vcf = FALSE,
+  vcf_reader = "data.table"
+)
+
+hh_eas <- data2haplohh(
+  hap_file = vfile_eas,
+  polarize_vcf = FALSE,
+  vcf_reader = "data.table"
+)
+
+# Identify the marker ID closest to rs3827760.
+# rehh stores marker positions inside the haplohh object.
+markers_eas <- tibble(
+  marker = rownames(hh_eas@positions),
+  position = as.integer(hh_eas@positions[, 1])
+)
+
+edar_marker <- markers_eas %>%
+  mutate(distance = abs(position - edar_pos)) %>%
+  arrange(distance) %>%
+  slice(1) %>%
+  pull(marker)
+
+edar_marker
+
+# EHH decay for both populations.
+ehh_afr <- calc_ehh(hh_afr, mrk = edar_marker)
+ehh_eas <- calc_ehh(hh_eas, mrk = edar_marker)
+
+plot(ehh_afr, main = "EHH decay around rs3827760: AFR/LWK")
+plot(ehh_eas, main = "EHH decay around rs3827760: EAS/CHS")
+
+# Furcation trees visualize how haplotypes branch away from the focal SNP.
+fur_afr <- calc_furcation(hh_afr, mrk = edar_marker)
+fur_eas <- calc_furcation(hh_eas, mrk = edar_marker)
+
+plot(fur_afr, main = "Furcation tree around rs3827760: AFR/LWK")
+plot(fur_eas, main = "Furcation tree around rs3827760: EAS/CHS")
+```
+
+How to read it:
+The vertical dashed line is the focal SNP (rs3827760).
+Each horizontal line is a haplotype.
+Every split (branching event) represents a recombination or mutation that differentiates haplotypes.
+Thick trunks = many chromosomes sharing the same haplotype.
+Rapid branching = haplotypes are diverse and old.
+What I see:
+There is only an ancestral haplotype tree (blue).
+No red (derived) tree appears.
+This means the derived EDAR allele is absent or extremely rare in LWK.
+Branching occurs very close to the focal SNP.
+Haplotypes quickly split into many different lineages.
+There is no long, unbroken trunk extending away from the focal site.
+The region contains many different haplotypes.
+This is what neutral evolution or an old polymorphism looks like.
+Recombination has had plenty of time to shuffle chromosomes.
+
+Blue (ancestral allele)
+Small number of chromosomes.
+Branches appear relatively close to the focal SNP.
+No particularly long shared haplotype.
+Red (derived allele)
+Massive, thick trunk centered on rs3827760.
+Very little branching near the focal SNP.
+Most chromosomes carrying the derived allele are almost identical over a large genomic region.
+Branching only begins tens of kb away from the core SNP.
+This pattern is precisely what happens when:
+A beneficial mutation appears.
+Selection rapidly increases its frequency.
+Nearby variants hitchhike.
+There is insufficient time for recombination to break apart the surrounding chromosome.
+As a result, hundreds of chromosomes look nearly identical near the selected site.
+
+
+
+## 5. iHS and XP-EHH
+
+The integrated haplotype score, iHS, compares haplotype length around ancestral versus derived alleles within one population. XP-EHH compares haplotype homozygosity between populations. For EDAR, XP-EHH is useful because a selected allele may be near fixation in EAS, where iHS loses power.
+
+```{r ihs-xpehh, eval=FALSE}
+library(rehh)
+
+# Genome/candidate-region haplotype scans.
+scan_afr <- scan_hh(hh_afr)
+scan_eas <- scan_hh(hh_eas)
+
+# iHS within each population.
+ihh_afr <- ihh2ihs(scan_afr, freqbin = 0.05)
+ihh_eas <- ihh2ihs(scan_eas, freqbin = 0.05)
+
+# Extract iHS table. Column names vary slightly across rehh versions, so inspect first.
+head(ihh_eas$ihs)
+
+# A robust helper for standard rehh output.
+extract_ihs <- function(ihs_obj) {
+  as_tibble(ihs_obj$ihs) %>%
+    rename_with(~ gsub("POSITION|POSITION_X", "POSITION", .x)) %>%
+    mutate(POSITION = as.integer(POSITION))
+}
+
+ihs_eas_tbl <- extract_ihs(ihh_eas)
+ihs_afr_tbl <- extract_ihs(ihh_afr)
+
+# Find candidate SNP or closest marker.
+edar_ihs_eas <- ihs_eas_tbl %>%
+  mutate(distance = abs(POSITION - edar_pos)) %>%
+  arrange(distance) %>%
+  slice(1)
+
+edar_ihs_eas
+
+# Empirical quantile using absolute iHS.
+# Extreme positive or negative values can both indicate unusual haplotype structure.
+tibble(
+  statistic = "abs(iHS_EAS)",
+  edar_value = abs(edar_ihs_eas$IHS),
+  empirical_quantile = empirical_quantile(abs(ihs_eas_tbl$IHS), abs(edar_ihs_eas$IHS))
+)
+
+# Single-site candidate-region iHS plot.
+ihs_eas_tbl %>%
+  filter(POSITION >= edar_pos - 500000, POSITION <= edar_pos + 500000) %>%
+  ggplot(aes(x = POSITION, y = IHS)) +
+  geom_point(alpha = 0.65, size = 1.2) +
+  geom_vline(xintercept = edar_pos, linetype = "dashed") +
+  theme_bw() +
+  labs(title = "EAS iHS around EDAR", x = "Position", y = "iHS")
+
+# Sliding-window summary of average absolute iHS.
+window_ihs <- function(ihs_tbl, pos_col = "POSITION", score_col = "IHS",
+                       size = 50, step = 40) {
+  ihs_tbl <- ihs_tbl %>% arrange(.data[[pos_col]])
+  starts <- seq(1, nrow(ihs_tbl) - size + 1, by = step)
+  map_dfr(starts, function(i) {
+    win <- ihs_tbl[i:(i + size - 1), ]
+    tibble(
+      start_pos = min(win[[pos_col]], na.rm = TRUE),
+      end_pos = max(win[[pos_col]], na.rm = TRUE),
+      mid_pos = mean(range(win[[pos_col]], na.rm = TRUE)),
+      n_snp = nrow(win),
+      mean_abs_ihs = mean(abs(win[[score_col]]), na.rm = TRUE)
+    )
+  })
+}
+
+win_ihs_eas <- window_ihs(ihs_eas_tbl, size = 50, step = 40)
+
+win_ihs_eas %>%
+  ggplot(aes(x = mid_pos, y = mean_abs_ihs)) +
+  geom_line() +
+  geom_vline(xintercept = edar_pos, linetype = "dashed") +
+  theme_bw() +
+  labs(title = "Windowed mean absolute iHS in EAS", x = "Position", y = "Mean |iHS|")
+
+# XP-EHH: positive values are usually interpreted as stronger EHH in population 1
+# relative to population 2, depending on the order supplied.
+xpehh_eas_vs_afr <- ies2xpehh(scan_pop1 = scan_eas, scan_pop2 = scan_afr)
+xpehh_tbl <- as_tibble(xpehh_eas_vs_afr) %>%
+  mutate(POSITION = as.integer(POSITION))
+
+# Windowed XP-EHH.
+window_score <- function(tbl, pos_col = "POSITION", score_col, size = 50, step = 40) {
+  tbl <- tbl %>% arrange(.data[[pos_col]])
+  starts <- seq(1, nrow(tbl) - size + 1, by = step)
+  map_dfr(starts, function(i) {
+    win <- tbl[i:(i + size - 1), ]
+    tibble(
+      start_pos = min(win[[pos_col]], na.rm = TRUE),
+      end_pos = max(win[[pos_col]], na.rm = TRUE),
+      mid_pos = mean(range(win[[pos_col]], na.rm = TRUE)),
+      mean_score = mean(win[[score_col]], na.rm = TRUE),
+      mean_abs_score = mean(abs(win[[score_col]]), na.rm = TRUE)
+    )
+  })
+}
+
+# Adjust score_col if your rehh version uses a different column name.
+names(xpehh_tbl)
+win_xpehh <- window_score(xpehh_tbl, score_col = "XPEHH", size = 50, step = 40)
+
+win_xpehh %>%
+  ggplot(aes(x = mid_pos, y = mean_score)) +
+  geom_line() +
+  geom_vline(xintercept = edar_pos, linetype = "dashed") +
+  theme_bw() +
+  labs(title = "Windowed XP-EHH: EAS vs AFR", x = "Position", y = "Mean XP-EHH")
+```
+
+### Take-home answer
+
+The strongest EDAR story is not just high allele-frequency differentiation. It is the combination of high EAS-specific differentiation, high PBS on the EAS branch, and unusually long haplotypes around the derived allele. Together, that triangulates a recent or relatively recent selective sweep rather than simple drift alone.
+
+## 6. Native American PBS analysis
+
+```{r nam-pbs}
+fst_nam_eas_file <- file.path(human_dir, "Chr2_NAM_EAS.weir.fst")
+fst_nam_eur_file <- file.path(human_dir, "Chr2_NAM_EUR.weir.fst")
+fst_eur_eas_file <- file.path(human_dir, "Chr2_EUR_EAS.weir.fst")
+
+fst_nam_eas <- read_fst(fst_nam_eas_file, "FST_NAM_EAS")
+fst_nam_eur <- read_fst(fst_nam_eur_file, "FST_NAM_EUR")
+fst_eur_eas <- read_fst(fst_eur_eas_file, "FST_EUR_EAS")
+
+nam_all <- fst_nam_eas %>%
+  inner_join(fst_nam_eur, by = c("CHROM", "POS")) %>%
+  inner_join(fst_eur_eas, by = c("CHROM", "POS")) %>%
+  mutate(
+    FST_NAM_EAS = zero_negative(FST_NAM_EAS),
+    FST_NAM_EUR = zero_negative(FST_NAM_EUR),
+    FST_EUR_EAS = zero_negative(FST_EUR_EAS),
+    PBS_NAM = calc_pbs(
+      fst_ab = FST_NAM_EAS,
+      fst_ac = FST_NAM_EUR,
+      fst_bc = FST_EUR_EAS
+    )
+  )
+
+edar_nam <- nam_all %>% filter(POS == edar_pos)
+edar_nam %>% select(CHROM, POS, FST_NAM_EAS, FST_NAM_EUR, FST_EUR_EAS, PBS_NAM)
+
+tibble(
+  statistic = "PBS_NAM",
+  edar_value = edar_nam$PBS_NAM,
+  empirical_quantile = empirical_quantile(nam_all$PBS_NAM, edar_nam$PBS_NAM)
+)
+
+plot_candidate_scan(nam_all, PBS_NAM, title = "PBS_NAM around EDAR", ylab = "PBS_NAM")
+```
+
+### Take-home answer
+
+If the EDAR functional variant has high frequency in both East Asians and Native Americans but PBS_NAM is also elevated, that suggests the Native American lineage carries a strong EDAR signal as well. The critical biological question is whether this reflects shared ancestry from the Beringian source population, selection after divergence, or both. If the same functional SNP is implicated, the case for repeated or carried-forward adaptive importance at EDAR becomes stronger.
+
+# Part 2: Genomic selection sweep scan in canines
+
+## 1. Bash preprocessing: extracting dog chromosome 15
+
+The following chunk is for the shell, not R. It extracts chromosome 15 for selected dog samples, filters minor allele frequency, indexes the BCF, and converts to PLINK format.
+
+```{bash dog-preprocessing, eval=FALSE}
+# 1. Extract chr15 and filter for samples and MAF >= 0.05.
+bcftools view \
+  -S input/Part_2_CanidDiversity/subset_dogs.txt \
+  -r chr15 \
+  -q 0.05:minor \
+  -O b \
+  -o input/Part_2_CanidDiversity/subset_chr15.bcf \
+  input/Part_2_CanidDiversity/AutoAndXPAR.Dog10K.phased.bcf
+
+# 2. Index the subset BCF.
+bcftools index input/Part_2_CanidDiversity/subset_chr15.bcf
+
+# 3. Convert BCF to PLINK binary format.
+plink1.9 \
+  --bcf input/Part_2_CanidDiversity/subset_chr15.bcf \
+  --dog \
+  --keep-allele-order \
+  --make-bed \
+  --out output/subset_chr15
+
+# 4. Run PCA in PLINK.
+plink1.9 \
+  --bfile output/subset_chr15 \
+  --dog \
+  --pca 20 \
+  --out output/subset_chr15_pca
+```
+
+## 2. PCA visualization
+
+```{r dog-pca}
+# PLINK eigenvec format: FID IID PC1 PC2 ...
+eigenvec_file <- file.path(out_dir, "subset_chr15_pca.eigenvec")
+eigenval_file <- file.path(out_dir, "subset_chr15_pca.eigenval")
+sample_info_file <- file.path(dog_dir, "sample_info.txt")
+
+pca <- fread(eigenvec_file, data.table = FALSE)
+n_pc <- ncol(pca) - 2
+names(pca) <- c("FID", "IID", paste0("PC", seq_len(n_pc)))
+
+eigenval <- scan(eigenval_file)
+var_explained <- eigenval / sum(eigenval) * 100
+
+sample_info <- fread(sample_info_file, data.table = FALSE)
+
+# Adjust join column if your metadata uses a different sample ID name.
+# Common possibilities: IID, Sample, sample, Sample.ID.
+if (!"IID" %in% names(sample_info)) {
+  id_col <- intersect(names(sample_info), c("Sample", "sample", "Sample.ID", "sample_id", "ID"))[1]
+  if (is.na(id_col)) stop("Could not find sample ID column in sample_info.txt")
+  sample_info <- sample_info %>% rename(IID = all_of(id_col))
+}
+
+pca_meta <- pca %>% left_join(sample_info, by = "IID")
+
+# Adjust these column names if the metadata uses slightly different names.
+breed_col <- intersect(names(pca_meta), c("Breed.Type", "Breed", "breed", "breed_type"))[1]
+size_col  <- intersect(names(pca_meta), c("size_group", "Size", "size", "Group", "group"))[1]
+
+if (is.na(breed_col)) breed_col <- "IID"
+if (is.na(size_col))  size_col  <- "IID"
+
+ggplot(pca_meta, aes(x = PC1, y = PC2, color = .data[[breed_col]], shape = .data[[size_col]])) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  theme_bw() +
+  labs(
+    title = "PCA of dog chromosome 15 genotypes",
+    x = paste0("PC1 (", round(var_explained[1], 2), "% variance)"),
+    y = paste0("PC2 (", round(var_explained[2], 2), "% variance)"),
+    color = "Breed",
+    shape = "Size group"
+  )
+```
+
+### Take-home answer
+
+In this subset, PC1 is expected to separate small and large breeds because the sample design intentionally contrasts body-size extremes. That means PC1 is not just vague population structure; it is partly aligned with a major phenotype and with breed history. This is useful for detecting body-size-associated selection, but it also means we need LD-aware approaches so one long sweep does not dominate the PCA.
+
+## 3. PCAdapt with LD clumping
+
+```{r pcadapt-ld-clumping, eval=FALSE}
+library(pcadapt)
+
+# PCAdapt can read PLINK bed files directly.
+bed_file <- file.path(out_dir, "subset_chr15.bed")
+bim_file <- file.path(out_dir, "subset_chr15.bim")
+
+# Read genotype matrix.
+# type = "bed" uses the PLINK binary files: .bed/.bim/.fam.
+G <- read.pcadapt(bed_file, type = "bed")
+
+# Run PCAdapt with K = 2 and LD clumping.
+# The exact argument names can vary by pcadapt version.
+# If this fails, check ?pcadapt and use LD.clumping = list(size = 500, thr = 0.1).
+pcadapt_fit <- pcadapt(
+  input = G,
+  K = 2,
+  LD.clumping = list(size = 500, thr = 0.1)
+)
+
+# Load physical positions from BIM.
+bim <- fread(bim_file, data.table = FALSE)
+names(bim) <- c("CHR", "SNP", "CM", "POS", "A1", "A2")
+
+pcadapt_results <- bim %>%
+  mutate(
+    pvalue = pcadapt_fit$pvalues,
+    log10p = -log10(pvalue),
+    POS_MB = POS / 1e6
+  )
+
+# Manhattan plot for chr15.
+ggplot(pcadapt_results, aes(x = POS_MB, y = log10p)) +
+  geom_point(alpha = 0.55, size = 0.8) +
+  annotate("rect", xmin = igf1_start / 1e6, xmax = igf1_end / 1e6,
+           ymin = -Inf, ymax = Inf, alpha = 0.12) +
+  theme_bw() +
+  labs(
+    title = "PCAdapt outlier scan on dog chromosome 15",
+    x = "Position on chromosome 15 (Mb)",
+    y = expression(-log[10](p))
+  )
+```
+
+### Take-home answer
+
+LD clumping reduces the ability of a single high-LD region to dominate the PCA and the outlier scan. Without clumping, a massive correlated block can create an artificial genome-wide axis and hide narrower but biologically important peaks. With clumping, the IGF1 region around roughly 41-45.5 Mb should become easier to detect as a body-size-associated sweep.
+
+## 4. Bash: outgroup polarization and XP-nSL
+
+```{bash dog-polarization, eval=FALSE}
+# 1. Extract wolf samples and combine with dog samples.
+bcftools query -l input/Part_2_CanidDiversity/AutoAndXPAR.Dog10K.phased.bcf | grep -E '^CLUP' > input/Part_2_CanidDiversity/wolves.txt
+cat input/Part_2_CanidDiversity/subset_dogs.txt input/Part_2_CanidDiversity/wolves.txt > input/Part_2_CanidDiversity/dogs_and_wolves.txt
+
+# 2. Extract polymorphic sites for both dogs and wolves.
+bcftools query -f '%CHROM\t%POS\n' input/Part_2_CanidDiversity/subset_chr15.bcf > input/Part_2_CanidDiversity/subset_chr15_positions.txt
+bcftools view \
+  -S input/Part_2_CanidDiversity/dogs_and_wolves.txt \
+  -T input/Part_2_CanidDiversity/subset_chr15_positions.txt \
+  -O z \
+  -o input/Part_2_CanidDiversity/subset_chr15_with_wolves.vcf.gz \
+  input/Part_2_CanidDiversity/AutoAndXPAR.Dog10K.phased.bcf
+
+# 3. Polarize alleles using the wolf major allele as ancestral.
+# This script should set ancestral allele = 0 and derived allele = 1.
+python3 scripts/polarize_by_wolves.py
+
+# 4. Recompress as BGZF and index.
+bcftools view input/Part_2_CanidDiversity/subset_chr15_polarized.vcf.gz \
+  -O z \
+  -o output/subset_chr15_polarized_bgzf.vcf.gz
+mv output/subset_chr15_polarized_bgzf.vcf.gz input/Part_2_CanidDiversity/subset_chr15_polarized.vcf.gz
+bcftools index -f input/Part_2_CanidDiversity/subset_chr15_polarized.vcf.gz
+
+# 5. Extract polarized VCFs for small and large dogs separately.
+bcftools view \
+  -S input/Part_2_CanidDiversity/small_dogs.txt \
+  -O z \
+  -o input/Part_2_CanidDiversity/small_dogs_polarized.vcf.gz \
+  input/Part_2_CanidDiversity/subset_chr15_polarized.vcf.gz
+bcftools index -f input/Part_2_CanidDiversity/small_dogs_polarized.vcf.gz
+
+bcftools view \
+  -S input/Part_2_CanidDiversity/large_dogs.txt \
+  -O z \
+  -o input/Part_2_CanidDiversity/large_dogs_polarized.vcf.gz \
+  input/Part_2_CanidDiversity/subset_chr15_polarized.vcf.gz
+bcftools index -f input/Part_2_CanidDiversity/large_dogs_polarized.vcf.gz
+```
+
+```{bash run-xpnsl, eval=FALSE}
+# Run phased XP-nSL using small dogs as target and large dogs as reference.
+# Positive XP-nSL should indicate longer haplotypes / stronger sweep signal in small dogs.
+
+selscan \
+  --xpnsl \
+  --vcf input/Part_2_CanidDiversity/small_dogs_polarized.vcf.gz \
+  --vcf-ref input/Part_2_CanidDiversity/large_dogs_polarized.vcf.gz \
+  --threads 4 \
+  --out output/xpnsl_phased
+
+# Normalize raw scores.
+selscan norm \
+  --xpnsl \
+  --files output/xpnsl_phased.xpnsl.out \
+  --out output/xpnsl_phased
+
+# Calculate 100 kb non-overlapping windows from normalized output.
+# This AWK code assumes the normalized file has columns including position and normalized score.
+# Inspect with: head output/xpnsl_phased.xpnsl.out.norm
+
+awk 'BEGIN{OFS="\t"; print "window_start","window_end","n_snp","n_top","frac_top"}
+     NR>1{
+       pos=$2; score=$NF;
+       win=int(pos/100000)*100000;
+       n[win]++;
+       if(score >= 2) top[win]++;
+     }
+     END{
+       for(w in n){
+         print w, w+99999, n[w], top[w]+0, (top[w]+0)/n[w]
+       }
+     }' output/xpnsl_phased.xpnsl.out.norm | sort -k1,1n > output/xpnsl_phased.xpnsl.out.norm.100kb.windows
+
+# Optional: copy files into input directory if the R exercise expects them there.
+cp output/xpnsl_phased.xpnsl.out.norm input/Part_2_CanidDiversity/xpnsl_phased.xpnsl.out.norm
+cp output/xpnsl_phased.xpnsl.out.norm.100kb.windows input/Part_2_CanidDiversity/xpnsl_phased.xpnsl.out.norm.100kb.windows
+```
+
+## 5. XP-nSL plots in R
+
+```{r xpnsl-plots}
+xpnsl_snp_file <- file.path(dog_dir, "xpnsl_phased.xpnsl.out.norm")
+xpnsl_win_file <- file.path(dog_dir, "xpnsl_phased.xpnsl.out.norm.100kb.windows")
+
+xpnsl <- fread(xpnsl_snp_file, data.table = FALSE)
+
+# Standard selscan norm files can have different column names depending on version.
+# Here we infer position and normalized score columns defensively.
+if (!"pos" %in% names(xpnsl)) {
+  pos_col <- intersect(tolower(names(xpnsl)), c("pos", "position"))[1]
+  if (is.na(pos_col)) pos_col <- names(xpnsl)[2]
+  names(xpnsl)[match(pos_col, tolower(names(xpnsl)))] <- "pos"
+}
+
+score_candidates <- c("normxpnsl", "xpnsl_norm", "norm", "z", "score")
+score_col <- intersect(tolower(names(xpnsl)), score_candidates)[1]
+if (is.na(score_col)) score_col <- names(xpnsl)[ncol(xpnsl)]
+names(xpnsl)[match(score_col, tolower(names(xpnsl)))] <- "z"
+
+xpnsl <- xpnsl %>%
+  mutate(
+    pos = as.numeric(pos),
+    z = as.numeric(z),
+    pvalue = 2 * pnorm(-abs(z)),
+    log10p = -log10(pvalue),
+    pos_mb = pos / 1e6
+  )
+
+# SNP-level Manhattan-like plot.
+ggplot(xpnsl, aes(x = pos_mb, y = log10p)) +
+  geom_point(alpha = 0.45, size = 0.7) +
+  annotate("rect", xmin = igf1_start / 1e6, xmax = igf1_end / 1e6,
+           ymin = -Inf, ymax = Inf, alpha = 0.12) +
+  theme_bw() +
+  labs(
+    title = "SNP-level XP-nSL scan: small vs large dogs",
+    x = "Position on chromosome 15 (Mb)",
+    y = expression(-log[10](pvalue~from~Z))
+  )
+
+# Window-based fraction of extreme positive SNPs.
+xpnsl_win <- fread(xpnsl_win_file, data.table = FALSE)
+names(xpnsl_win) <- tolower(names(xpnsl_win))
+
+# Make the code robust to slightly different window-file names.
+if (!"window_start" %in% names(xpnsl_win)) names(xpnsl_win)[1] <- "window_start"
+if (!"window_end" %in% names(xpnsl_win)) names(xpnsl_win)[2] <- "window_end"
+if (!"frac_top" %in% names(xpnsl_win)) names(xpnsl_win)[ncol(xpnsl_win)] <- "frac_top"
+
+xpnsl_win <- fread(xpnsl_win_file, data.table = FALSE)
+names(xpnsl_win) <- tolower(names(xpnsl_win))
+
+# Inspect first
+str(xpnsl_win)
+head(xpnsl_win)
+
+# Robust column renaming
+if (!"window_start" %in% names(xpnsl_win)) names(xpnsl_win)[1] <- "window_start"
+if (!"window_end" %in% names(xpnsl_win)) names(xpnsl_win)[2] <- "window_end"
+if (!"frac_top" %in% names(xpnsl_win)) names(xpnsl_win)[ncol(xpnsl_win)] <- "frac_top"
+
+# Force numeric
+xpnsl_win <- xpnsl_win %>%
+  mutate(
+    window_start = as.numeric(window_start),
+    window_end   = as.numeric(window_end),
+    frac_top     = as.numeric(frac_top),
+    mid = (window_start + window_end) / 2,
+    mid_mb = mid / 1e6
+  )
+
+xpnsl_win_clean <- xpnsl_win %>%
+  filter(
+    !is.na(frac_top),
+    frac_top >= 0
+  )
+
+summary(xpnsl_win_clean$frac_top)
+
+ggplot(xpnsl_win_clean, aes(x = mid_mb, y = frac_top)) +
+  geom_col(width = 0.09) +
+  annotate(
+    "rect",
+    xmin = igf1_start / 1e6,
+    xmax = igf1_end / 1e6,
+    ymin = -Inf,
+    ymax = Inf,
+    alpha = 0.12
+  ) +
+  theme_bw() +
+  labs(
+    title = "100 kb windowed XP-nSL outlier fraction",
+    x = "Position on chromosome 15 (Mb)",
+    y = "Fraction of SNPs with normalized XP-nSL >= 2"
+  )
+
+```
+
+### Take-home answer
+
+Polarization matters because `selscan` interprets allele `0` as ancestral and allele `1` as derived. Using gray wolves as the outgroup is a practical way to approximate the ancestral allele for domestic dogs. SNP-level XP-nSL can look noisy because individual haplotype statistics are variable and correlated. Window summaries reduce site-level stochasticity and make long sweep regions easier to see.
+
+## 6. Rsb using rehh
+
+```{r rsb-rehh, eval=FALSE}
+library(rehh)
+
+small_vcf <- file.path(dog_dir, "small_dogs_polarized.vcf.gz")
+large_vcf <- file.path(dog_dir, "large_dogs_polarized.vcf.gz")
+
+# Load polarized phased VCFs.
+# Since wolves were used to polarize alleles, 0 should represent ancestral and 1 derived.
+hh_small <- data2haplohh(
+  hap_file = small_vcf,
+  polarize_vcf = TRUE,
+  vcf_reader = "data.table"
+)
+
+hh_large <- data2haplohh(
+  hap_file = large_vcf,
+  polarize_vcf = TRUE,
+  vcf_reader = "data.table"
+)
+
+# Haplotype homozygosity scans.
+scan_small <- scan_hh(hh_small)
+scan_large <- scan_hh(hh_large)
+
+# Rsb: positive values indicate stronger integrated haplotype homozygosity in pop1.
+rsb <- ines2rsb(scan_pop1 = scan_small, scan_pop2 = scan_large)
+rsb_tbl <- as_tibble(rsb)
+
+# Standardize column names defensively.
+names(rsb_tbl) <- toupper(names(rsb_tbl))
+if (!"POSITION" %in% names(rsb_tbl)) {
+  pos_col <- intersect(names(rsb_tbl), c("POS", "BP"))[1]
+  names(rsb_tbl)[names(rsb_tbl) == pos_col] <- "POSITION"
+}
+if (!"RSB" %in% names(rsb_tbl)) {
+  rsb_col <- grep("RSB", names(rsb_tbl), value = TRUE)[1]
+  names(rsb_tbl)[names(rsb_tbl) == rsb_col] <- "RSB"
+}
+
+rsb_tbl <- rsb_tbl %>%
+  mutate(
+    POSITION = as.numeric(POSITION),
+    POS_MB = POSITION / 1e6
+  )
+
+ggplot(rsb_tbl, aes(x = POS_MB, y = RSB)) +
+  geom_point(alpha = 0.55, size = 0.7) +
+  annotate("rect", xmin = igf1_start / 1e6, xmax = igf1_end / 1e6,
+           ymin = -Inf, ymax = Inf, alpha = 0.12) +
+  theme_bw() +
+  labs(
+    title = "Rsb scan: small dogs vs large dogs",
+    x = "Position on chromosome 15 (Mb)",
+    y = "Rsb"
+  )
+```
+
+### Take-home answer
+
+Rsb and XP-nSL both compare haplotype structure between populations, but they measure distance differently. Rsb integrates EHH decay over physical distance, while XP-nSL uses the number of segregating sites rather than base-pair distance. In domestic dogs, long-range LD and strong artificial selection can make Rsb produce a very clear, high-amplitude peak at IGF1. XP-nSL may be more robust to recombination-rate uncertainty but can look noisier at the SNP level.
+
+Outgroup polarization does not destroy phasing. In a phased genotype such as `0|1`, the vertical bar records which allele is on which homolog. Flipping allele labels from `0` to `1` and `1` to `0` changes ancestral/derived labels but preserves the chromosome-level haplotype structure.
+
+# Final conceptual summary
+
+The EDAR and IGF1 examples illustrate the same broad population-genomic principle: selection is easiest to believe when independent signals agree. Frequency-based statistics such as $F_{ST}$ and PBS show unusual allele-frequency differentiation; haplotype statistics such as EHH, iHS, XP-EHH, XP-nSL, and Rsb show whether that differentiation sits on an unusually long haplotype background. In evolutionary terms, the most convincing selection story is not one extreme point in one statistic, but a coherent pattern across allele frequency, branch-specific differentiation, and local haplotype structure.
